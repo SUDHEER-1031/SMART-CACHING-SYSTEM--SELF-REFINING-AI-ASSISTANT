@@ -5,15 +5,13 @@ from groq import Groq
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore 
+from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 import os
 import logging
 import tempfile
-
-# --- RAG IMPORTS ---
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +24,6 @@ load_dotenv()
 db = None
 cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
 if not cred_path:
-    # Check relative to backend/main.py
     candidate = os.path.join(os.path.dirname(__file__), "firebase-credentials.json")
     if os.path.exists(candidate):
         cred_path = candidate
@@ -47,7 +44,7 @@ else:
 
 app = FastAPI(
     title="Smart Caching System API",
-    description="Self-Refining AI Assistant with LangChain RAG & Firebase Firestore Caching",
+    description="Self-Refining AI Assistant with Vector RAG & Firebase Firestore Caching",
     version="1.0.0"
 )
 
@@ -69,7 +66,7 @@ else:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, 
+    allow_origins=origins if origins != ["*"] else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,10 +75,45 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     query: str
 
-# 3. Initialize RAG Components
-# Free, local embedding model from HuggingFace
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vector_store = None  # Stores uploaded document vectors in memory
+# 3. High-Performance, Low-Memory Vector Store for RAG
+class LightweightVectorStore:
+    def __init__(self):
+        self.chunks = []
+        self.vectorizer = None
+        self.tfidf_matrix = None
+
+    def add_documents(self, new_chunks: list[str]):
+        if not new_chunks:
+            return
+        self.chunks.extend(new_chunks)
+        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
+        self.tfidf_matrix = self.vectorizer.fit_transform(self.chunks)
+
+    def similarity_search(self, query: str, k: int = 3) -> list[str]:
+        if not self.chunks or self.vectorizer is None or self.tfidf_matrix is None:
+            return []
+        try:
+            query_vec = self.vectorizer.transform([query])
+            sims = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
+            top_indices = np.argsort(sims)[::-1][:k]
+            return [self.chunks[i] for i in top_indices if sims[i] > 0]
+        except Exception as e:
+            logger.warning(f"Vector search calculation error: {e}")
+            return []
+
+vector_store = LightweightVectorStore()
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> list[str]:
+    chunks = []
+    start = 0
+    clean_text = " ".join(text.split())
+    while start < len(clean_text):
+        end = start + chunk_size
+        chunk = clean_text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += (chunk_size - overlap)
+    return chunks
 
 # 4. Helper for Groq clients
 def get_groq_clients():
@@ -111,15 +143,14 @@ async def health_check():
     return {
         "status": "healthy",
         "firebase_connected": db is not None,
-        "rag_ready": vector_store is not None
+        "rag_ready": len(vector_store.chunks) > 0,
+        "indexed_chunks": len(vector_store.chunks)
     }
 
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
     """Endpoint to upload a PDF, extract text, and add it to our Vector Store."""
-    global vector_store
-
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
@@ -129,32 +160,33 @@ async def upload_document(file: UploadFile = File(...)):
         if not content:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        # Save the uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Load and split the PDF
-        loader = PyPDFLoader(tmp_path)
-        docs = loader.load()
+        # Extract text using PyPDF
+        reader = PdfReader(tmp_path)
+        full_text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                full_text += page_text + "\n"
 
-        if not docs:
-            raise HTTPException(status_code=400, detail="Could not extract any content from the PDF.")
+        if not full_text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract any readable text from the PDF.")
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
-
+        # Chunk text
+        splits = chunk_text(full_text)
         if not splits:
             raise HTTPException(status_code=400, detail="PDF has no readable text chunks.")
 
-        # Add to FAISS vector store
-        if vector_store is None:
-            vector_store = FAISS.from_documents(splits, embeddings)
-        else:
-            vector_store.add_documents(splits)
+        # Add to vector store
+        vector_store.add_documents(splits)
 
         logger.info(f"Embedded {len(splits)} chunks from {file.filename}")
-        return {"message": f"Successfully processed and embedded {file.filename} ({len(splits)} chunks)"}
+        return {
+            "message": f"Successfully processed and embedded {file.filename} ({len(splits)} chunks)"
+        }
 
     except HTTPException:
         raise
@@ -162,7 +194,6 @@ async def upload_document(file: UploadFile = File(...)):
         logger.error(f"Error processing PDF upload: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
     finally:
-        # Guarantee cleanup of temporary file
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -195,12 +226,12 @@ async def chat_endpoint(request: QueryRequest):
 
     # 2. Retrieve Context from Documents (RAG)
     context = ""
-    if vector_store is not None:
-        try:
-            relevant_docs = vector_store.similarity_search(query_raw, k=3)
-            context = "\n\n".join([doc.page_content for doc in relevant_docs if doc.page_content])
-        except Exception as e:
-            logger.warning(f"Vector search failed: {e}")
+    try:
+        relevant_docs = vector_store.similarity_search(query_raw, k=3)
+        if relevant_docs:
+            context = "\n\n".join(relevant_docs)
+    except Exception as e:
+        logger.warning(f"Vector search failed: {e}")
 
     # Construct an augmented prompt if we have context
     if context:
@@ -263,7 +294,6 @@ Rules:
             logger.warning(f"Groq evaluator failed ({e}); falling back to fresh AI answer")
             result = ai_answer
 
-        # If cache available and answer refined, update Firebase
         if cache_ref is not None and doc_id:
             try:
                 cache_ref.document(doc_id).update({"answer": result})
@@ -273,7 +303,6 @@ Rules:
         return {"answer": result, "cached": True, "refined": True}
 
     else:
-        # Save new query to Firebase if cache is available
         if cache_ref is not None:
             try:
                 cache_ref.add({

@@ -1,6 +1,6 @@
 services:
   # -------------------------------------------------------------
-  # 1. Backend Web Service (FastAPI + Groq + LangChain + Firestore)
+  # 1. Backend Web Service (FastAPI + Groq + Vector RAG + Firestore)
   # -------------------------------------------------------------
   - type: web
     name: smart-caching-backend
@@ -10,6 +10,7 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: api_request
         sync: false
