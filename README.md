@@ -6,6 +6,7 @@
 [![Groq](https://img.shields.io/badge/Groq-LPU_Inference-f55036.svg?style=flat)](https://groq.com)
 [![Firebase](https://img.shields.io/badge/Firebase-Firestore-FFCA28.svg?style=flat&logo=Firebase&logoColor=black)](https://firebase.google.com)
 [![LangChain](https://img.shields.io/badge/LangChain-RAG-1C3C3C.svg?style=flat)](https://python.langchain.com)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/SUDHEER-1031/SMART-CACHING-SYSTEM--SELF-REFINING-AI-ASSISTANT)
 
 A high-performance, full-stack AI Assistant application featuring **intelligent semantic caching**, **Retrieval-Augmented Generation (RAG)** for PDF documents, and an **autonomous AI evaluator** that continuously refines stored knowledge.
 
